@@ -1,0 +1,102 @@
+name: Watcher TGWS independent update
+on:
+  schedule:
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: tgws-publisher
+  cancel-in-progress: false
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      needed: ${{ steps.discover.outputs.needed }}
+      version: ${{ steps.discover.outputs.version }}
+      commit: ${{ steps.discover.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - id: discover
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python tools/channel.py discover --repo "$GITHUB_REPOSITORY"
+  build:
+    needs: discover
+    if: needs.discover.outputs.needed == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: Flowseal/tg-ws-proxy
+          ref: ${{ needs.discover.outputs.commit }}
+          path: upstream
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - run: python -m pip install -r requirements-ci.txt
+      - env:
+          PROXY_VERSION: ${{ needs.discover.outputs.version }}
+          UPSTREAM_COMMIT: ${{ needs.discover.outputs.commit }}
+        run: python tools/channel.py build --source upstream --version "$env:PROXY_VERSION" --commit "$env:UPSTREAM_COMMIT" --out out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tested-proxy
+          path: out/
+          if-no-files-found: error
+          retention-days: 3
+  publish:
+    needs: [discover, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    # This job checks out only our own channel code; it never executes upstream code.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install cryptography==46.0.5
+      - uses: actions/download-artifact@v4
+        with:
+          name: tested-proxy
+          path: out
+      - name: Validate and sign package
+        env:
+          PROXY_VERSION: ${{ needs.discover.outputs.version }}
+          UPSTREAM_COMMIT: ${{ needs.discover.outputs.commit }}
+          TGWS_SIGNING_KEY: ${{ secrets.TGWS_SIGNING_KEY }}
+          TGWS_PUBLIC_KEY: ${{ vars.TGWS_PUBLIC_KEY }}
+        run: python tools/channel.py sign --repo "$GITHUB_REPOSITORY" --version "$PROXY_VERSION" --commit "$UPSTREAM_COMMIT" --out out
+      - name: Publish complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROXY_VERSION: ${{ needs.discover.outputs.version }}
+          UPSTREAM_COMMIT: ${{ needs.discover.outputs.commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="proxy-v${PROXY_VERSION}"
+          archive="out/WatcherTgWsProxy-${PROXY_VERSION}-windows-x64.zip"
+          # Never modify an existing published version. A failed draft can be
+          # removed by the repository owner; it is not visible to Watcher.
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft \
+            --title "Watcher TGWS CLI ${PROXY_VERSION}" \
+            --notes "Upstream: Flowseal/tg-ws-proxy@${UPSTREAM_COMMIT}. CLI and local listener checks passed." \
+            "$archive" out/latest.json out/update-feed.json
+          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --latest
